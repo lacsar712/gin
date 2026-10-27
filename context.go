@@ -94,6 +94,11 @@ type Context struct {
 	// SameSite allows a server to define a cookie attribute making it impossible for
 	// the browser to send this cookie along with cross-site requests.
 	sameSite http.SameSite
+
+	// htmlFuncStack is the request-scoped stack of HTML template function
+	// frames. It is per request: concurrent requests never share frames, and
+	// it is cleared when the request finishes.
+	htmlFuncStack []HTMLFuncFrame
 }
 
 /************************************/
@@ -115,6 +120,7 @@ func (c *Context) reset() {
 	c.sameSite = 0
 	*c.params = (*c.params)[:0]
 	*c.skippedNodes = (*c.skippedNodes)[:0]
+	c.resetHTMLFuncs()
 }
 
 // Copy returns a copy of the current context that can be safely used outside the request's scope.
@@ -1207,6 +1213,16 @@ func (c *Context) Render(code int, r render.Render) {
 		return
 	}
 
+	// Bind the request-scoped HTML function stack before executing the
+	// template. This is the single point all HTML exits (HTML, HTMLBlob and
+	// direct use of Render) pass through; non-HTML renders do not implement
+	// render.HTMLFuncsRenderer and are left untouched.
+	if len(c.htmlFuncStack) > 0 {
+		if htmlRender, ok := r.(render.HTMLFuncsRenderer); ok {
+			r = htmlRender.WithFuncs(c.mergedHTMLFuncs())
+		}
+	}
+
 	if err := r.Render(c.Writer); err != nil {
 		// Pushing error to c.Errors
 		_ = c.Error(err)
@@ -1218,9 +1234,30 @@ func (c *Context) Render(code int, r render.Render) {
 // It also updates the HTTP code and sets the Content-Type as "text/html".
 // See http://golang.org/doc/articles/wiki/
 func (c *Context) HTML(code int, name string, obj any) {
+	c.html(code, name, obj)
+}
+
+// HTMLBlob renders the HTTP template specified by its name with the given
+// data, applying the same request-scoped template function stack as HTML.
+// It also updates the HTTP code and sets the Content-Type as "text/html".
+func (c *Context) HTMLBlob(code int, name string, obj any) {
+	c.html(code, name, obj)
+}
+
+func (c *Context) html(code int, name string, obj any) {
 	if c.engine.HTMLRender == nil {
 		c.Render(code, render.HTML{})
 		return
+	}
+
+	// When request-scoped funcs are present, prefer the funcs-aware instance:
+	// HTMLDebug parses lazily and must receive the merged map at parse time,
+	// otherwise template text using a brand-new func name would fail to parse.
+	if len(c.htmlFuncStack) > 0 {
+		if renderer, ok := c.engine.HTMLRender.(render.HTMLRenderFuncs); ok {
+			c.Render(code, renderer.InstanceWithFuncs(name, obj, c.mergedHTMLFuncs()))
+			return
+		}
 	}
 
 	instance := c.engine.HTMLRender.Instance(name, obj)

@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin/internal/bytesconv"
-	filesystem "github.com/gin-gonic/gin/internal/fs"
 	"github.com/gin-gonic/gin/render"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
@@ -293,9 +292,12 @@ func (engine *Engine) SecureJsonPrefix(prefix string) *Engine {
 // LoadHTMLGlob loads HTML files identified by glob pattern
 // and associates the result with HTML renderer.
 func (engine *Engine) LoadHTMLGlob(pattern string) {
-	left := engine.delims.Left
-	right := engine.delims.Right
-	templ := template.Must(template.New("").Delims(left, right).Funcs(engine.FuncMap).ParseGlob(pattern))
+	production := render.HTMLProduction{
+		Delims:  engine.delims,
+		Glob:    pattern,
+		FuncMap: engine.FuncMap,
+	}
+	templ := template.Must(production.ParseSources())
 
 	if IsDebugging() {
 		debugPrintLoadTemplate(templ)
@@ -303,7 +305,8 @@ func (engine *Engine) LoadHTMLGlob(pattern string) {
 		return
 	}
 
-	engine.SetHTMLTemplate(templ)
+	production.Template = templ
+	engine.setHTMLProduction(production)
 }
 
 // LoadHTMLFiles loads a slice of HTML files
@@ -314,8 +317,13 @@ func (engine *Engine) LoadHTMLFiles(files ...string) {
 		return
 	}
 
-	templ := template.Must(template.New("").Delims(engine.delims.Left, engine.delims.Right).Funcs(engine.FuncMap).ParseFiles(files...))
-	engine.SetHTMLTemplate(templ)
+	production := render.HTMLProduction{
+		Delims:  engine.delims,
+		Files:   files,
+		FuncMap: engine.FuncMap,
+	}
+	production.Template = template.Must(production.ParseSources())
+	engine.setHTMLProduction(production)
 }
 
 // LoadHTMLFS loads an http.FileSystem and a slice of patterns
@@ -326,18 +334,30 @@ func (engine *Engine) LoadHTMLFS(fs http.FileSystem, patterns ...string) {
 		return
 	}
 
-	templ := template.Must(template.New("").Delims(engine.delims.Left, engine.delims.Right).Funcs(engine.FuncMap).ParseFS(
-		filesystem.FileSystem{FileSystem: fs}, patterns...))
-	engine.SetHTMLTemplate(templ)
+	production := render.HTMLProduction{
+		Delims:     engine.delims,
+		FileSystem: fs,
+		Patterns:   patterns,
+		FuncMap:    engine.FuncMap,
+	}
+	production.Template = template.Must(production.ParseSources())
+	engine.setHTMLProduction(production)
 }
 
 // SetHTMLTemplate associate a template with HTML renderer.
 func (engine *Engine) SetHTMLTemplate(templ *template.Template) {
+	engine.setHTMLProduction(render.HTMLProduction{Template: templ})
+}
+
+// setHTMLProduction stores an HTMLProduction renderer. The retained sources of
+// production allow request-scoped template funcs to be bound per request.
+func (engine *Engine) setHTMLProduction(production render.HTMLProduction) {
 	if len(engine.trees) > 0 {
 		debugPrintWARNINGSetHTMLTemplate()
 	}
 
-	engine.HTMLRender = render.HTMLProduction{Template: templ.Funcs(engine.FuncMap)}
+	production.Template = production.Template.Funcs(engine.FuncMap)
+	engine.HTMLRender = production
 }
 
 // SetFuncMap sets the FuncMap used for template.FuncMap.
@@ -700,6 +720,12 @@ func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	engine.handleHTTPRequest(c)
 
+	// The request-scoped HTML function stack must not outlive the request,
+	// even for frames that were pushed but never popped. A render issued
+	// after this point (for example from a background goroutine holding c)
+	// therefore sees an empty stack.
+	c.resetHTMLFuncs()
+
 	engine.pool.Put(c)
 }
 
@@ -712,6 +738,7 @@ func (engine *Engine) HandleContext(c *Context) {
 	c.reset()
 	engine.handleHTTPRequest(c)
 
+	c.resetHTMLFuncs()
 	c.index = oldIndexValue
 	c.handlers = oldHandlers
 }
